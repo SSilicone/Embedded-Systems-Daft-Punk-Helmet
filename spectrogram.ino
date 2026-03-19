@@ -1,346 +1,309 @@
+// =============================================================================
+//  ESP32 + MAX4466 → Real-Time Audio Spectrogram on WS2812B LED Matrix
+//  Built with PlatformIO + Arduino framework
+//
+//  WIRING:
+//    MAX4466 OUT  → GPIO35  (ADC1_CH7, input-only pin — analog read only)
+//    MAX4466 VCC  → 3.3V
+//    MAX4466 GND  → GND
+//    LED Matrix DATA → GPIO18
+//    LED Matrix VCC  → 5V (use external supply for large matrices!)
+//    LED Matrix GND  → GND (share GND with ESP32)
+//
+//  REQUIRED LIBRARIES (auto-installed via platformio.ini lib_deps):
+//    - FastLED        by Daniel Garcia   (LED control)
+//    - arduinoFFT     by Enrique Gomez   (frequency analysis)
+// =============================================================================
+
 #include <Arduino.h>
-#include <driver/i2s.h>
-#include <arduinoFFT.h>
+#include <driver/i2s.h>   // ESP-IDF I2S driver, built into ESP32 Arduino core — no install needed
 #include <FastLED.h>
+#include <arduinoFFT.h>
 
 // =============================================================================
-//  HARDWARE CONFIGURATION
-//  Change these if you rewire your setup.
-// =============================================================================
-#define I2S_PORT       I2S_NUM_0
-#define ADC_CHANNEL    ADC1_CHANNEL_7   // GPIO35
-#define LED_PIN        18               // FastLED data pin
-#define MATRIX_WIDTH   32               // Number of frequency columns
-#define MATRIX_HEIGHT  8                // Number of amplitude rows (1–8)
-#define NUM_LEDS       (MATRIX_WIDTH * MATRIX_HEIGHT)
-
-// =============================================================================
-//  FFT / SAMPLING CONFIGURATION
-//  SAMPLE_RATE and SAMPLES control frequency resolution.
-//
-//  Frequency resolution  = SAMPLE_RATE / SAMPLES
-//  Max detectable freq   = SAMPLE_RATE / 2  (Nyquist)
-//
-//  At 20480 Hz sample rate and 512 samples:
-//    - Each raw FFT bin is 40 Hz wide (20480 / 512)
-//    - Max frequency is ~10240 Hz  ← good for music
-//    - Total usable FFT bins: 256  (SAMPLES / 2)
-//
-//  If you raise SAMPLE_RATE you capture higher frequencies but lose
-//  low-frequency detail. If you raise SAMPLES you get finer resolution
-//  but each FFT frame takes longer to fill.
-// =============================================================================
-#define SAMPLE_RATE    20480
-#define SAMPLES        512
-
-
-// =============================================================================
-//  ★ FREQUENCY BIN TUNING — EDIT THIS SECTION TO EXPERIMENT ★
-//
-//  These two values define the slice of the audio spectrum displayed
-//  across the 32 columns of your matrix.
-//
-//  Recommended ranges for music:
-//    - Sub-bass / kick drum:  20 –  80 Hz
-//    - Bass / bass guitar:    80 – 300 Hz
-//    - Midrange / vocals:    300 – 3000 Hz
-//    - Presence / harmonics: 3000 – 6000 Hz
-//    - Air / cymbals:        6000 – 10000 Hz
-//
-//  Setting MIN_FREQ = 60 and MAX_FREQ = 8000 covers the musically
-//  interesting range well for a speaker in a room.
-//
-//  The mapping between columns and frequencies is LOGARITHMIC, meaning
-//  low frequencies are spread across more columns (more detail in bass),
-//  while high frequencies are compressed into fewer columns — matching
-//  how human hearing actually works.
-// =============================================================================
-#define MIN_FREQ       60        // Hz — lowest frequency shown (leftmost column)
-                                 // Lower this (e.g. 40) to capture more sub-bass.
-                                 // Raise it (e.g. 100) to reduce rumble / mic noise.
-
-#define MAX_FREQ       8000      // Hz — highest frequency shown (rightmost column)
-                                 // Lower this (e.g. 5000) to zoom in on mids.
-                                 // Raise it (e.g. 10000) to include more highs
-                                 //   (capped by SAMPLE_RATE / 2 = 10240 Hz).
-
-
-// =============================================================================
-//  ★ AMPLITUDE TUNING — EDIT THIS SECTION TO EXPERIMENT ★
-//
-//  These values control how the FFT magnitude maps onto the 8 LED rows.
-//
-//  NOISE_FLOOR: Magnitude values below this are treated as silence and
-//    clamped to zero. Raise it if idle noise lights up the bottom rows.
-//    Lower it if quiet passages disappear entirely.
-//    For a microphone picking up a nearby speaker, 500–1200 is typical.
-//
-//  AMPLITUDE_SCALE: Divides the magnitude to fit within 8 rows.
-//    Raise this if the bars are always hitting the top (too sensitive).
-//    Lower this if the bars rarely get above row 3 (not sensitive enough).
-//    Start at 1500 and tune in increments of 200.
-//
-//  DECAY_RATE: How many rows the bar drops per frame when the signal falls.
-//    Lower values (0.1) = slow, smooth fall — good for ambient / slow music.
-//    Higher values (0.5) = fast, punchy fall — good for EDM / percussion.
-// =============================================================================
-#define NOISE_FLOOR       800    // Raw FFT magnitude — silence below this
-#define AMPLITUDE_SCALE   1500   // Divisor: magnitude / AMPLITUDE_SCALE = rows
-#define DECAY_RATE        0.2f   // Rows dropped per frame during decay
-
-
-// =============================================================================
-//  DERIVED CONSTANTS  (do not edit — calculated from values above)
+//  MATRIX CONFIGURATION
+//  Adjust these to match your physical hardware.
 // =============================================================================
 
-// Width of one raw FFT bin in Hz
-#define HZ_PER_BIN  ((float)SAMPLE_RATE / (float)SAMPLES)
+#define LED_PIN         18          // GPIO pin connected to matrix DATA line
+#define NUM_COLS        32          // Number of columns (frequency bands displayed)
+#define NUM_ROWS        8           // Number of rows (bar height resolution)
+#define NUM_LEDS        (NUM_COLS * NUM_ROWS)
+#define LED_TYPE        WS2812B     // Your LED chipset — common alternatives: WS2811, SK6812
+#define COLOR_ORDER     GRB         // Pixel color byte order — try RGB or BGR if colors look wrong
+#define MAX_BRIGHTNESS  150         // 0–255. Stay ≤150 unless using a dedicated 5V power supply.
+                                    // At full brightness, 256 WS2812B LEDs can draw ~15A!
 
-// Convert a frequency in Hz to its FFT bin index
-// Clamp to [1, SAMPLES/2-1] so we never read the DC bin (bin 0) or out-of-bounds
-inline int freqToBin(float hz) {
-  int bin = (int)(hz / HZ_PER_BIN);
-  if (bin < 1)             bin = 1;
-  if (bin >= SAMPLES / 2)  bin = (SAMPLES / 2) - 1;
-  return bin;
-}
+// =============================================================================
+//  ADC / I2S (MICROPHONE) CONFIGURATION
+// =============================================================================
 
+#define I2S_PORT        I2S_NUM_0
+#define ADC_CHANNEL     ADC1_CHANNEL_7  // Maps to GPIO35. If you move the mic wire,
+                                         // update this — see ESP32 ADC1 channel map:
+                                         // CH0=GPIO36, CH3=GPIO39, CH4=GPIO32,
+                                         // CH5=GPIO33, CH6=GPIO34, CH7=GPIO35
+
+#define SAMPLE_RATE     40000       // Samples per second (Hz).
+                                    // ↑ Higher = captures higher frequencies (max ~20kHz for music)
+                                    //   but uses more CPU per loop iteration.
+                                    // ↓ Lower = faster FFT, but misses high-pitched sounds.
+                                    // 40000 Hz captures up to 20kHz (full human hearing range).
+                                    // Try 20000 if you only care about voice/bass.
+
+#define FFT_SAMPLES     512         // Number of audio samples per FFT frame. MUST be a power of 2.
+                                    // ↑ Higher (1024, 2048) = finer frequency resolution,
+                                    //   smoother spectrum, but slower loop (more CPU).
+                                    // ↓ Lower (256) = faster/snappier response, less freq detail.
+                                    // 512 is a solid middle ground for music visualization.
+                                    //
+                                    // Frequency resolution = SAMPLE_RATE / FFT_SAMPLES
+                                    // At 40000Hz / 512 = ~78Hz per bin. Each bin covers 78Hz.
+
+#define DMA_BUF_LEN     256         // I2S DMA buffer length in samples. Must be power of 2, max 1024.
+                                    // Smaller = lower latency but more CPU interrupts.
+#define DMA_BUF_COUNT   4           // Number of DMA buffers. Total DMA RAM = BUF_LEN × BUF_COUNT × 2 bytes.
+
+// =============================================================================
+//  SPECTROGRAM VISUAL TUNING
+//  These are the main knobs to tweak if the display looks wrong.
+// =============================================================================
+
+#define NOISE_FLOOR     300.0f      // FFT magnitudes below this value are treated as silence.
+                                    // ↑ Raise this if LEDs flicker randomly in a quiet room.
+                                    // ↓ Lower this if the display barely reacts to quiet sounds.
+                                    // Typical range: 100–600 depending on your mic gain trim pot.
+
+#define GAIN            2.0f        // Amplification applied after the noise floor is subtracted.
+                                    // ↑ Raise if bars stay stubbornly short even with loud audio.
+                                    // ↓ Lower if bars always slam to the top and stay there.
+
+#define MAX_MAGNITUDE   4000.0f     // Expected maximum FFT magnitude (after gain).
+                                    // This sets the "ceiling" — a bar reaches full height when
+                                    // magnitude hits this value. Tune alongside GAIN:
+                                    // ↓ Lower = bars reach top more easily (more sensitive)
+                                    // ↑ Higher = bars only max out at very loud sounds
+
+#define DECAY           0.78f       // Controls how fast bars fall after a peak (0.0–1.0).
+                                    // ↑ Higher (e.g. 0.9) = bars hang longer, trails persist
+                                    // ↓ Lower  (e.g. 0.5) = bars drop instantly, very snappy
+                                    // Good music viz range: 0.7–0.85
 
 // =============================================================================
 //  GLOBALS
 // =============================================================================
+
 CRGB leds[NUM_LEDS];
 
-float vReal[SAMPLES];
-float vImag[SAMPLES];
-ArduinoFFT<float> FFT = ArduinoFFT<float>(vReal, vImag, SAMPLES, SAMPLE_RATE);
+// FFT input/output arrays. vReal gets audio samples, vImag starts at 0.
+// After FFT.compute(), vReal contains the frequency magnitudes.
+double vReal[FFT_SAMPLES];
+double vImag[FFT_SAMPLES];
 
-// Smoothed visual heights for each column (float for sub-row decay precision)
-float peakHeights[MATRIX_WIDTH] = {0};
+// ArduinoFFT v2.x uses a constructor-based API (not static methods).
+ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, FFT_SAMPLES, SAMPLE_RATE);
 
-// Shared amplitude array written by Core 0, read by Core 1.
-// volatile prevents the compiler from caching stale values across cores.
-volatile uint8_t columnAmplitudes[MATRIX_WIDTH] = {0};
-
-TaskHandle_t AudioTaskHandle;
-
+// Smoothed bar heights per column, range 0.0–1.0
+float barHeights[NUM_COLS] = {0};
 
 // =============================================================================
-//  I2S SETUP
+//  I2S INITIALIZATION
+//  Configures the ESP32's built-in I2S peripheral to drive the ADC continuously.
+//  This gives us much better sample timing than analogRead() in a loop,
+//  which has jitter and can't reliably hit 40kHz.
 // =============================================================================
 void setupI2S() {
-  i2s_config_t i2s_config = {
+  i2s_config_t cfg = {
     .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),
     .sample_rate          = SAMPLE_RATE,
     .bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,  // Mono mic — only use left channel
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count        = 2,
-    .dma_buf_len          = SAMPLES,
-    .use_apll             = false,
+    .dma_buf_count        = DMA_BUF_COUNT,
+    .dma_buf_len          = DMA_BUF_LEN,
+    .use_apll             = false,                       // APLL gives cleaner clock but isn't needed here
     .tx_desc_auto_clear   = false,
     .fixed_mclk           = 0
   };
 
-  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
   i2s_set_adc_mode(ADC_UNIT_1, ADC_CHANNEL);
   i2s_adc_enable(I2S_PORT);
 }
 
-
 // =============================================================================
-//  CORE 0 TASK — Audio sampling, FFT, bin mapping
+//  AUDIO CAPTURE
+//  Fills vReal[] with FFT_SAMPLES audio samples from the ADC via I2S DMA.
+//  Each raw 16-bit I2S word holds a 12-bit ADC value in the lower 12 bits.
+//  We convert to signed (-2048 to +2047) so FFT works correctly.
 // =============================================================================
-void audioTask(void *pvParameters) {
-  uint16_t i2sBuffer[SAMPLES];
-  size_t   bytesRead;
+void captureAudio() {
+  uint16_t rawBuf[DMA_BUF_LEN];
+  int samplesRead = 0;
 
-  // ── Pre-compute the FFT bin boundaries for each column ──────────────────
-  //
-  //  We calculate these once at startup rather than every frame to save CPU.
-  //
-  //  The mapping is logarithmic: column c spans frequencies
-  //    f_start(c) = MIN_FREQ * (MAX_FREQ / MIN_FREQ) ^ (c / MATRIX_WIDTH)
-  //    f_end(c)   = MIN_FREQ * (MAX_FREQ / MIN_FREQ) ^ ((c+1) / MATRIX_WIDTH)
-  //
-  //  This is the standard "octave band" approach used in real spectrum
-  //  analysers and matches the logarithmic nature of musical pitch.
-  //
-  //  Example at default settings (60–8000 Hz, 32 columns):
-  //    Col  0:   60 –   70 Hz  (sub-bass, kick drum fundamental)
-  //    Col  4:   87 –  102 Hz  (bass guitar open E)
-  //    Col  8:  126 –  148 Hz  (bass guitar upper range)
-  //    Col 12:  183 –  215 Hz  (lower midrange)
-  //    Col 16:  266 –  312 Hz  (vocal fundamentals begin)
-  //    Col 20:  386 –  453 Hz  (vocal formants)
-  //    Col 24:  560 –  657 Hz  (guitar body resonance)
-  //    Col 28: 1290 – 1513 Hz  (upper mids, presence)
-  //    Col 31: 6834 – 8000 Hz  (air, cymbals, sibilance)
-  //
-  //  To print these boundaries to Serial for inspection, temporarily
-  //  uncomment the Serial.printf lines in the loop below.
-  // ────────────────────────────────────────────────────────────────────────
+  while (samplesRead < FFT_SAMPLES) {
+    size_t bytesRead = 0;
+    // portMAX_DELAY = wait indefinitely until DMA buffer is ready (non-blocking spin)
+    i2s_read(I2S_PORT, rawBuf, sizeof(rawBuf), &bytesRead, portMAX_DELAY);
+    int count = bytesRead / sizeof(uint16_t);
 
-  int binStart[MATRIX_WIDTH];
-  int binEnd[MATRIX_WIDTH];
-
-  float freqRatio = (float)MAX_FREQ / (float)MIN_FREQ;
-
-  for (int col = 0; col < MATRIX_WIDTH; col++) {
-    float fStart = MIN_FREQ * pow(freqRatio, (float)col        / MATRIX_WIDTH);
-    float fEnd   = MIN_FREQ * pow(freqRatio, (float)(col + 1)  / MATRIX_WIDTH);
-
-    binStart[col] = freqToBin(fStart);
-    binEnd[col]   = freqToBin(fEnd);
-
-    // Guard: each column must span at least one FFT bin
-    if (binEnd[col] <= binStart[col]) {
-      binEnd[col] = binStart[col] + 1;
+    for (int i = 0; i < count && samplesRead < FFT_SAMPLES; i++) {
+      // Mask lower 12 bits → unsigned 0–4095
+      // Subtract 2048 → signed -2048 to +2047 (centers waveform at zero for FFT)
+      vReal[samplesRead] = (double)((rawBuf[i] & 0x0FFF) - 2048);
+      vImag[samplesRead] = 0.0;  // Imaginary part must be zeroed before each FFT run
+      samplesRead++;
     }
-
-    // Uncomment to debug boundaries on first boot:
-    // Serial.printf("Col %2d: %.0f–%.0f Hz → bins %d–%d\n",
-    //               col, fStart, fEnd, binStart[col], binEnd[col]);
-  }
-
-  // ── Main audio loop ──────────────────────────────────────────────────────
-  for (;;) {
-
-    // 1. Fill the sample buffer from the ADC via I2S DMA
-    i2s_read(I2S_PORT, &i2sBuffer, sizeof(i2sBuffer), &bytesRead, portMAX_DELAY);
-
-    // 2. Copy to FFT input array and remove DC offset
-    //    DC offset (the non-zero average of a resting ADC signal) would
-    //    dominate bin 0 and bleed into bin 1, so we subtract the mean.
-    float mean = 0;
-    for (int i = 0; i < SAMPLES; i++) {
-      vReal[i] = (float)i2sBuffer[i];
-      vImag[i] = 0.0f;
-      mean += vReal[i];
-    }
-    mean /= SAMPLES;
-    for (int i = 0; i < SAMPLES; i++) vReal[i] -= mean;
-
-    // 3. Apply Hamming window to reduce spectral leakage
-    //    (prevents energy from one frequency "leaking" into adjacent bins)
-    FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
-
-    // 4. Compute FFT and convert complex output to magnitudes
-    FFT.compute(FFTDirection::Forward);
-    FFT.complexToMagnitude();
-    // After this, vReal[0..SAMPLES/2-1] holds the magnitude of each bin.
-    // vReal[0] is DC (skip it). vReal[1] is HZ_PER_BIN Hz, etc.
-
-    // 5. Map FFT magnitudes onto the 32 matrix columns
-    for (int col = 0; col < MATRIX_WIDTH; col++) {
-
-      // Average the magnitudes across all raw FFT bins in this column's
-      // frequency range. Averaging (vs. peak) makes the display more
-      // stable and less twitchy for music content.
-      float avg = 0;
-      for (int b = binStart[col]; b < binEnd[col]; b++) {
-        avg += vReal[b];
-      }
-      avg /= (binEnd[col] - binStart[col]);
-
-      // ── Noise gate ──────────────────────────────────────────────────────
-      //  Discard anything below NOISE_FLOOR. This prevents idle mic hiss
-      //  and electrical noise from showing faint bars when music stops.
-      //  Adjust NOISE_FLOOR in the tuning section above.
-      if (avg < NOISE_FLOOR) avg = 0;
-
-      // ── Scale magnitude to LED rows (0.0 – 8.0) ─────────────────────────
-      //  Divide by AMPLITUDE_SCALE so that typical music peaks hit
-      //  somewhere in the upper half of the matrix.
-      //  Adjust AMPLITUDE_SCALE in the tuning section above.
-      float targetHeight = avg / AMPLITUDE_SCALE;
-      if (targetHeight > MATRIX_HEIGHT) targetHeight = MATRIX_HEIGHT;  // hard cap at 8
-
-      // ── Temporal smoothing (gravity / decay) ─────────────────────────────
-      //  If the new reading is higher → snap up immediately (instant attack).
-      //  If the new reading is lower  → fall gradually at DECAY_RATE rows/frame.
-      //  This gives the classic "bouncing bar" look.
-      if (targetHeight >= peakHeights[col]) {
-        peakHeights[col] = targetHeight;
-      } else {
-        peakHeights[col] -= DECAY_RATE;
-        if (peakHeights[col] < 0) peakHeights[col] = 0;
-      }
-
-      // Write the integer height (1–8) to the shared array.
-      // Cast truncates toward zero, so 0.9 → 0 (no LED), 1.0 → 1 (one LED).
-      columnAmplitudes[col] = (uint8_t)peakHeights[col];
-    }
-
-    vTaskDelay(1 / portTICK_PERIOD_MS);
   }
 }
 
+// =============================================================================
+//  LED INDEX MAPPING
+//
+//  Translates logical (col, row) coordinates to a physical LED index.
+//  col = 0 is leftmost (bass), col = NUM_COLS-1 is rightmost (treble)
+//  row = 0 is the bottom bar, row = NUM_ROWS-1 is the top
+//
+//  This assumes SERPENTINE wiring (the most common matrix layout):
+//    Row 0 (bottom): LEDs 0  → 31   left to right
+//    Row 1:          LEDs 63 → 32   right to left  ← direction flips each row
+//    Row 2:          LEDs 64 → 95   left to right
+//    ...etc
+//
+//  ⚠ IF YOUR MATRIX LOOKS SCRAMBLED: Your wiring layout differs. Common fixes:
+//    - Non-serpentine (all rows left→right): remove the `if/else`, always use
+//      `return displayRow * NUM_COLS + col;`
+//    - Origin at top-left: remove the `displayRow` flip, use `row` directly
+//    - Vertical wiring (columns run top→bottom): swap row/col math
+// =============================================================================
+int getLEDIndex(int col, int row) {
+  // Flip vertically: row 0 = bottom of matrix = last physical row
+  int displayRow = (NUM_ROWS - 1) - row;
+
+  if (displayRow % 2 == 0) {
+    return displayRow * NUM_COLS + col;               // Even rows: left → right
+  } else {
+    return displayRow * NUM_COLS + (NUM_COLS - 1 - col); // Odd rows: right → left
+  }
+}
 
 // =============================================================================
-//  SETUP (Core 1)
+//  DRAW SPECTROGRAM BARS
+//
+//  Renders one vertical bar per column using barHeights[] (0.0–1.0).
+//  Color goes from blue (quiet/low rows) up through green/yellow to red (loud/top).
+//  This mimics a classic spectrum analyzer look.
+// =============================================================================
+void drawBars() {
+  FastLED.clear();  // Wipe all LEDs to black before redrawing
+
+  for (int col = 0; col < NUM_COLS; col++) {
+    // Convert normalized height (0.0–1.0) to a pixel row count
+    int barTop = constrain((int)(barHeights[col] * (NUM_ROWS - 1) + 0.5f), 0, NUM_ROWS - 1);
+
+    for (int row = 0; row <= barTop; row++) {
+      // Map row position to hue: 160 (blue) at bottom → 0 (red) at top
+      // HSV color wheel: 0=red, 32=orange, 64=yellow, 96=green, 160=blue
+      uint8_t hue = map(row, 0, NUM_ROWS - 1, 160, 0);
+      leds[getLEDIndex(col, row)] = CHSV(hue, 255, 255);
+
+      // 💡 Alternative color schemes to try:
+      //   All green:  CRGB::Green
+      //   Heat map:   CHSV(map(row, 0, NUM_ROWS-1, 96, 0), 255, 255)  // green→red only
+      //   Cool blue:  CHSV(160, 255, map(row, 0, NUM_ROWS-1, 80, 255)) // dim→bright blue
+    }
+  }
+
+  FastLED.show();  // Push buffer to LEDs over the data wire
+}
+
+// =============================================================================
+//  SETUP
 // =============================================================================
 void setup() {
   Serial.begin(115200);
+  Serial.println("Spectrogram init...");
 
-  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
-  FastLED.setBrightness(50);
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  FastLED.setBrightness(MAX_BRIGHTNESS);
   FastLED.clear();
   FastLED.show();
 
   setupI2S();
 
-  // Pin the audio/FFT task to Core 0 so it doesn't compete with FastLED on Core 1
-  xTaskCreatePinnedToCore(
-    audioTask,
-    "Audio_FFT",
-    10000,           // Stack depth in words — increase if you see stack overflows
-    NULL,
-    1,               // Task priority (1 = normal; raise to 2 if audio stutters)
-    &AudioTaskHandle,
-    0                // Core 0
-  );
+  Serial.println("Ready — listening for audio.");
 }
 
-
 // =============================================================================
-//  LOOP / DISPLAY (Core 1) — reads shared amplitudes, drives LEDs
+//  MAIN LOOP  (runs continuously, ~30–60 times per second at these settings)
 // =============================================================================
 void loop() {
-  FastLED.clear();
 
-  for (int x = 0; x < MATRIX_WIDTH; x++) {
-    int height = columnAmplitudes[x];   // 0–8
+  // ── Step 1: Fill vReal[] with fresh audio samples via I2S DMA ──────────────
+  captureAudio();
 
-    for (int y = 0; y < height; y++) {
+  // ── Step 2: Apply Hann window ───────────────────────────────────────────────
+  // A window function tapers the sample block to zero at both ends.
+  // Without this, the FFT "sees" a hard edge at the buffer boundary and
+  // produces false high-frequency noise (spectral leakage). Always use this.
+  FFT.windowing(FFTWindow::Hann, FFTDirection::Forward);
 
-      // ── Serpentine (snake) layout ───────────────────────────────────────
-      //  WESIRI matrices wire columns in alternating directions:
-      //    Even columns (0, 2, 4 …): LED 0 is at the BOTTOM, count upward
-      //    Odd  columns (1, 3, 5 …): LED 0 is at the TOP,    count downward
-      //
-      //  If your matrix is wired differently (e.g. all columns bottom-up),
-      //  remove the if/else and just use:
-      //    pixelIndex = (x * MATRIX_HEIGHT) + y;
-      int pixelIndex;
-      if (x % 2 == 0) {
-        pixelIndex = (x * MATRIX_HEIGHT) + y;
-      } else {
-        pixelIndex = (x * MATRIX_HEIGHT) + (MATRIX_HEIGHT - 1 - y);
-      }
+  // ── Step 3: Run the FFT ─────────────────────────────────────────────────────
+  // Transforms FFT_SAMPLES time-domain samples → FFT_SAMPLES/2 frequency bins.
+  // After this call, vReal[i] holds the magnitude of frequency bin i.
+  // Bin i corresponds to frequency: i × (SAMPLE_RATE / FFT_SAMPLES) Hz
+  FFT.compute(FFTDirection::Forward);
+  FFT.complexToMagnitude();  // Converts complex (real+imag) output to scalar magnitudes
 
-      // ── Colour: hue sweeps left-to-right across the full spectrum ────────
-      //  Low-frequency columns (left)  → red / orange  (hue near 0)
-      //  High-frequency columns (right) → blue / violet (hue near 255)
-      //  Change the hue formula to experiment with other colour schemes, e.g.:
-      //    Height-based:  CHSV(y * (255 / MATRIX_HEIGHT), 255, 255)
-      //    Single colour: CHSV(160, 255, 255)  // solid blue
-      leds[pixelIndex] = CHSV(x * (255 / MATRIX_WIDTH), 255, 255);
+  // ── Step 4: Map frequency bins → display columns ────────────────────────────
+  // We use a LOGARITHMIC scale so low frequencies (bass) get more columns.
+  // This matches human pitch perception — an octave always looks the same width.
+  // A linear scale would cram all the bass into the first 1–2 columns.
+  //
+  // halfSamples = the number of useful FFT output bins (Nyquist limit)
+  int halfSamples = FFT_SAMPLES / 2;  // = 256 bins, each covering ~78Hz at 40kHz/512
+
+  for (int col = 0; col < NUM_COLS; col++) {
+
+    // Log-scale bin range for this column:
+    // Column 0 maps to the very low bins (bass), column NUM_COLS-1 maps to high bins (treble)
+    float freqStart = powf((float)halfSamples, (float)col       / NUM_COLS);
+    float freqEnd   = powf((float)halfSamples, (float)(col + 1) / NUM_COLS);
+
+    int binStart = max(1, (int)freqStart);           // Skip bin 0 — it's the DC offset (useless)
+    int binEnd   = max(binStart + 1, (int)freqEnd);  // Ensure at least 1 bin per column
+    binEnd       = min(binEnd, halfSamples);
+
+    // Average magnitudes across all bins in this column's frequency range.
+    // Averaging (rather than taking the peak) gives a smoother, less spiky display.
+    float sum = 0;
+    for (int b = binStart; b < binEnd; b++) {
+      sum += (float)vReal[b];
+    }
+    float avg = sum / (float)(binEnd - binStart);
+
+    // Apply noise floor: ignore everything below ambient electrical noise level
+    // Apply gain: amplify the remaining signal
+    float level = max(0.0f, avg - NOISE_FLOOR) * GAIN;
+
+    // Normalize to 0.0–1.0 using MAX_MAGNITUDE as the ceiling
+    float normalized = constrain(level / MAX_MAGNITUDE, 0.0f, 1.0f);
+
+    // Smooth the bar height with exponential decay:
+    //   - Bars RISE instantly to the new level (snappy attack)
+    //   - Bars FALL gradually using the DECAY multiplier (smooth release)
+    if (normalized > barHeights[col]) {
+      barHeights[col] = normalized;
+    } else {
+      barHeights[col] = barHeights[col] * DECAY + normalized * (1.0f - DECAY);
     }
   }
 
-  FastLED.show();
+  // ── Step 5: Render bars to the LED matrix ───────────────────────────────────
+  drawBars();
 
-  vTaskDelay(16 / portTICK_PERIOD_MS);  // ~60 FPS
+  // Optional: print the loudest frequency to Serial Monitor for debugging
+   double peakHz = FFT.majorPeak();
+   Serial.printf("Peak: %.1f Hz\n", peakHz);
 }
