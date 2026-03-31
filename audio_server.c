@@ -253,6 +253,7 @@ int32_t btAudioCallback(Frame* data, int32_t frame_count) {
     AudioChunk* chunk = nullptr;
 
     if (xQueueReceive(g_resampledQueue, &chunk, 0) != pdTRUE) {
+        Serial.println("[BT] Callback fired but queue empty — sending silence");
         memset(data, 0, frame_count * sizeof(Frame));
         return frame_count;
     }
@@ -312,6 +313,17 @@ void startAudioPipeline() {
     xTaskCreatePinnedToCore(taskWiFiReader, "WiFiReader", 8192, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(taskResampler,  "Resampler",  4096, nullptr, 3, nullptr, 0);
     xTaskCreatePinnedToCore(taskPotReader,  "PotReader",  2048, nullptr, 1, nullptr, 0);
+
+    // ★ NEW: Wait until the resampled queue has at least 4 chunks ready
+//   before starting Bluetooth. This ensures the callback never starves.
+Serial.println("[Pipeline] Pre-filling audio buffer before BT start...");
+UBaseType_t queueCount = 0;
+while (queueCount < 4) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    queueCount = uxQueueMessagesWaiting(g_resampledQueue);
+    Serial.printf("[Pipeline] Buffer level: %d / 4 chunks\n", queueCount);
+}
+Serial.println("[Pipeline] Buffer ready — starting Bluetooth.");
 
     a2dpSource.set_auto_reconnect(false);
     a2dpSource.start("Cancan", btAudioCallback);
