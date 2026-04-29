@@ -5,7 +5,7 @@ I've decided to create a Daft Punk helmet that uses surrounding audio (preferabl
 
 2 Inputs:
 - Surrounding audio into a microphone
-- songs uploaded to a makeshift MP3 (or SD card)
+- modulated SD card audio
 
 2 Outputs:
 - Helmet LED screen
