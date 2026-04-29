@@ -60,7 +60,11 @@ Before starting bluetooth, the code pre-fills the resampled queue with several a
 I would like to note that external memory or PSRAM incorporated into the ESP32 is necessary to have enough space for the queues, resampler, bluetooth streaming, etc. Internal RAM is too small to hold all the audio buffers simultaneously, so extra RAM is needed to prevent crashing and allow smooth operation. 
 
 # Flowh Chart
-![Microphone-LED](Microphone-LED.drawio.svg)
+
+### Microphone to LED Matrix:
+![Microphone-LED](Microphone-LED.drawio.svg) 
+### Audio Playback:
+![AudioPlayback](AudioPlayback.drawio.svg)
 
 ## User Guide
 1. Find your desired audio recording and create a .wav file format of it. Name it "audio.wav" for the code to recognize it.
