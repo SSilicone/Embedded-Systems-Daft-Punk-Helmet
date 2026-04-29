@@ -1,34 +1,31 @@
-// audio_pipeline.h
-// Include this in ANY .cpp file that needs to talk to the audio pipeline.
-// The #pragma once ensures it's only processed once per compilation.
+// =============================================================================
+//  audio_pipeline.h
+// =============================================================================
 #pragma once
-
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
-// ─────────────────────────────────────────────────────────────────
-//  AudioChunk — the shared data structure
-//  Both audio_pipeline.cpp and your main.cpp need to agree on
-//  what an AudioChunk looks like. Defining it here means both
-//  files see exactly the same definition automatically.
-// ─────────────────────────────────────────────────────────────────
-#define AUDIO_CHUNK_SAMPLES 2048  // Must match the value in audio_pipeline.cpp
+// ── Shared buffer sizes ──────────────────────────────────────────────────────
+#define AUDIO_CHUNK_SAMPLES  2048   // stereo pairs per raw/resampled chunk
+#define FFT_CHUNK_SAMPLES     512   // stereo pairs per FFT chunk (power of 2)
 
+// ── Raw / resampled audio chunk (used by SD reader, resampler, BT) ───────────
 struct AudioChunk {
-    int16_t samples[AUDIO_CHUNK_SAMPLES*2 ]; // Stereo interleaved: L,R,L,R,...
-    int     count;                             // How many stereo pairs are valid
+    int16_t samples[AUDIO_CHUNK_SAMPLES * 2];  // L,R interleaved
+    int     count;                              // valid stereo pairs
 };
 
-// ─────────────────────────────────────────────────────────────────
-//  extern declarations
-//  These tell main.cpp "these variables exist in audio_pipeline.cpp"
-//  The keyword extern means: "don't allocate memory for this here,
-//  just trust that it exists somewhere and the linker will find it."
-// ─────────────────────────────────────────────────────────────────
-extern QueueHandle_t g_fftQueue;  // Your spectrogram reads from this
+// ── FFT chunk — a COPY of audio data, owned entirely by the FFT consumer ─────
+//  Sized to FFT_CHUNK_SAMPLES so it's much smaller than AudioChunk and
+//  doesn't waste PSRAM. The resampler copies into this before handing it off.
+struct FFTChunk {
+    int16_t samples[FFT_CHUNK_SAMPLES * 2];   // L,R interleaved
+    int     count;                             // valid stereo pairs
+};
 
-// ─────────────────────────────────────────────────────────────────
-//  Function declaration
-//  Tells main.cpp that startAudioPipeline() exists and can be called.
-// ─────────────────────────────────────────────────────────────────
+// ── Queue handles exposed to main.cpp ────────────────────────────────────────
+extern QueueHandle_t g_fftQueue;      // resampler → FFT consumer (main loop)
+extern QueueHandle_t g_fftFreePool;   // recycled FFTChunks
+
+// ── Entry point ──────────────────────────────────────────────────────────────
 void startAudioPipeline();
