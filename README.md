@@ -17,7 +17,7 @@ If you plan to make your own Daft Punk helemt using similar materials, I highly 
 
 ## Real Time Spectrogram
 
-### Microhpne:
+### Microphone:
 This project uses a MAX4466, which is an analog microphone. To translate the analog signal into digital values, the ESP32 uses I2S with ADC mdoe to sample and conver the analog signal into discreeet voltage measurements. 
 
 For this project, the I2S program measures 1,024 samples at a time, 40,000 times per second. This gives the ESP32 enough data to distinguish lower bass tones up to around 20,000Hz.
