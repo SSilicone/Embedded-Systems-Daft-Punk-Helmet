@@ -59,6 +59,9 @@ Before starting bluetooth, the code pre-fills the resampled queue with several a
 ### Memory
 I would like to note that external memory or PSRAM incorporated into the ESP32 is necessary to have enough space for the queues, resampler, bluetooth streaming, etc. Internal RAM is too small to hold all the audio buffers simultaneously, so extra RAM is needed to prevent crashing and allow smooth operation. 
 
+# Flowh Chart
+
+
 ## User Guide
 1. Find your desired audio recording and create a .wav file format of it. Name it "audio.wav" for the code to recognize it.
 2. Adjsut the program to recognize your specific bluetooth speaker. In the lat line of audio_pipeline.cpp change "J22" to your specific bluetooth device's name.
