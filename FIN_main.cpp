@@ -2,17 +2,45 @@
 //  main.cpp
 //  ESP32 WROVER + MAX4466 → real-time audio spectrogram on WS2812B 8×32 matrix
 //
+//  IMPROVED VERSION  ─  noise-robust, perceptually balanced, intuitive
+//                       attack / decay semantics.
+//
+//  PROCESSING PIPELINE (per frame, ~30 Hz):
+//    1.  Capture 1024 ADC samples from the MAX4466 → remove DC.
+//    2.  Hann window + FFT → 512 magnitude bins.
+//    3.  For each of 32 display columns:
+//          a. Combine the column's bins (70 % peak / 30 % mean) so a single
+//             noisy bin can't dominate, but harmonics still pop visibly.
+//          b. Convert to dB — human hearing is logarithmic; the display
+//             should be too. This stops loud signals from saturating the
+//             top while quiet signals stay invisible at the bottom.
+//          c. Apply a gentle high-frequency tilt: music is naturally pink
+//             (low-freq heavy), so without compensation the left side of
+//             the matrix always wins regardless of what's actually playing.
+//          d. Subtract a per-column ADAPTIVE noise floor that slowly tracks
+//             whatever steady background level each column sees. This kills
+//             60 Hz hum, fan noise, mic self-noise, and PSU coupling
+//             without any manual tuning.
+//          e. Hard gate anything within `margin` dB of the floor → 0
+//             (eliminates residual flicker on quiet bars).
+//          f. Normalize against a fixed dB `range` so bar height represents
+//             "how much louder than this column's own background".
+//          g. Asymmetric attack / decay smoothing — BOTH are now smoothing
+//             coefficients in 0..1 with the same meaning ("fraction of the
+//             way to target per frame"). Higher = more responsive.
+//    4.  Render per-row colored bar plus a peak-hold dot.
+//
 //  SERIAL COMMANDS (115200 baud):
-//    gain   <float>   amplification after floor             (default 2.5)
-//    floor  <float>   per-bin magnitude noise gate          (default 250.0)
-//    max    <float>   per-bin peak that fills a full bar    (default 22000.0)
-//    decay  <0–1>     bar fall speed  (0=instant, 1=never)  (default 0.85)
-//    attack <0–1>     bar rise speed  (0=instant, 1=never)  (default 0.70)
-//    bright <0–255>   global LED brightness                 (default 160)
-//    pdrop  <float>   peak-hold dot fall speed per frame    (default 0.025)
-//    phold  <int>     frames to hold peak dot before drop   (default 18)
-//    status           print all current values
-//    help             print command list
+//    attack <0–1>    rise responsiveness     default 0.45  (higher = snappier)
+//    decay  <0–1>    fall responsiveness     default 0.08  (lower  = bars hang)
+//    range  <dB>     dB above floor = full   default 28.0
+//    tilt   <dB>     high-freq boost (total) default 8.0
+//    margin <dB>     gate above noise floor  default 4.0
+//    bright <0–255>  LED brightness          default 160
+//    pdrop  <float>  peak dot fall/frame     default 0.020
+//    phold  <int>    frames to hold peak     default 18
+//    reset           re-learn the noise floor from current input
+//    status / help
 // =============================================================================
 
 #include <Arduino.h>
@@ -22,7 +50,7 @@
 #include "audio_pipeline.h"
 
 // =============================================================================
-//  MATRIX
+//  HARDWARE
 // =============================================================================
 #define LED_PIN      13
 #define NUM_COLS     32
@@ -31,66 +59,48 @@
 #define LED_TYPE     WS2812B
 #define COLOR_ORDER  GRB
 
-// =============================================================================
-//  I2S / ADC  (MAX4466 → GPIO 35 / ADC1_CH7)
-// =============================================================================
 #define I2S_PORT      I2S_NUM_0
-#define ADC_CHANNEL   ADC1_CHANNEL_7
+#define ADC_CHANNEL   ADC1_CHANNEL_7      // GPIO 35
 #define SAMPLE_RATE   40000
 #define FFT_SAMPLES   1024
 #define DMA_BUF_LEN   512
 #define DMA_BUF_COUNT 4
 
-// =============================================================================
-//  FREQUENCY WINDOW
-//  bin resolution = 40000/1024 ≈ 39 Hz per bin
-//  BIN_LOW   3  →  ~117 Hz  (skip DC + rumble)
-//  BIN_HIGH 200 → ~7800 Hz
-// =============================================================================
+// 40000 / 1024 ≈ 39 Hz/bin.  3 → ~117 Hz, 200 → ~7800 Hz.
 #define BIN_LOW    3
 #define BIN_HIGH  200
 
 // =============================================================================
-//  DEFAULTS
+//  RUNTIME PARAMETERS  (all live-tunable over serial)
 // =============================================================================
-#define DEFAULT_GAIN      2.5f
-#define DEFAULT_FLOOR   250.0f
-#define DEFAULT_MAX   22000.0f   // peak-bin values run higher than averages
-#define DEFAULT_DECAY     0.85f
-#define DEFAULT_ATTACK    0.70f
-#define DEFAULT_BRIGHT   160
-#define DEFAULT_PDROP     0.025f
-#define DEFAULT_PHOLD     18
+float   g_attack   = 0.45f;    // 0..1, fraction of remaining gap closed per frame on rise
+float   g_decay    = 0.08f;    // 0..1, ditto on fall
+float   g_rangeDb  = 28.0f;    // dB above floor that fills the full bar
+float   g_tiltDb   = 8.0f;     // total high-frequency boost across the spectrum (dB)
+float   g_marginDb = 4.0f;     // hard gate: any value within this many dB of floor → 0
+uint8_t g_bright   = 160;
+float   g_pdrop    = 0.020f;
+int     g_phold    = 18;
 
 // =============================================================================
-//  RUNTIME PARAMETERS
-// =============================================================================
-float   g_gain   = DEFAULT_GAIN;
-float   g_floor  = DEFAULT_FLOOR;
-float   g_max    = DEFAULT_MAX;
-float   g_decay  = DEFAULT_DECAY;
-float   g_attack = DEFAULT_ATTACK;
-uint8_t g_bright = DEFAULT_BRIGHT;
-float   g_pdrop  = DEFAULT_PDROP;
-int     g_phold  = DEFAULT_PHOLD;
-
-// =============================================================================
-//  GLOBALS
+//  STATE
 // =============================================================================
 CRGB  leds[NUM_LEDS];
 float vReal[FFT_SAMPLES];
 float vImag[FFT_SAMPLES];
 ArduinoFFT<float> FFT(vReal, vImag, FFT_SAMPLES, SAMPLE_RATE);
 
-float   barHeights[NUM_COLS] = {0};   // smoothed bar height, 0.0–1.0
-float   peakHold[NUM_COLS]   = {0};   // floating peak-dot position, 0.0–1.0
-uint8_t peakTimer[NUM_COLS]  = {0};   // frames remaining in hold phase
+float   barHeights[NUM_COLS]   = {0};   // smoothed display height, 0..1
+float   peakHold[NUM_COLS]     = {0};   // floating peak-dot position, 0..1
+uint8_t peakTimer[NUM_COLS]    = {0};   // hold-phase frame counter
+float   noiseFloorDb[NUM_COLS];         // per-column adaptive noise floor (dB)
+bool    noiseFloorInit = false;         // false → seed on first frame
 
 int binStart[NUM_COLS];
 int binEnd[NUM_COLS];
 
 // =============================================================================
-//  BIN BOUNDARIES  (logarithmic)
+//  LOGARITHMIC BIN BOUNDARIES
 // =============================================================================
 void computeBinBoundaries() {
     float logLow  = logf((float)BIN_LOW);
@@ -151,11 +161,6 @@ void setupI2S() {
 
 // =============================================================================
 //  AUDIO CAPTURE + DC REMOVAL
-//
-//  After reading raw samples the actual mean is subtracted so a true
-//  zero-mean signal enters the FFT. This prevents ADC DC bias from leaking
-//  energy across all bins and causing the false low-frequency peaks seen
-//  previously (peak freq: 4 Hz etc).
 // =============================================================================
 void captureAudio() {
     uint16_t raw[DMA_BUF_LEN];
@@ -169,7 +174,7 @@ void captureAudio() {
             vImag[n] = 0.0f;
         }
     }
-    // Remove residual DC offset
+    // Subtract the actual mean so the FFT sees a true zero-mean signal.
     float mean = 0.0f;
     for (int i = 0; i < FFT_SAMPLES; i++) mean += vReal[i];
     mean /= FFT_SAMPLES;
@@ -190,87 +195,78 @@ int getLEDIndex(int col, int row) {
 }
 
 // =============================================================================
-//  COLOR MAPPING
-//
-//  Bar body: per-row gradient, blue at bottom → red near top.
-//  Peak dot: bright white so it always stands out above the bar body.
+//  COLORS — blue at the bottom, red at the top, white peak dot.
 // =============================================================================
 CRGB rowColor(int row) {
-    // Row 0 = bottom (blue), Row 7 = top (red)
-    float frac   = (float)row / (float)(NUM_ROWS - 1);  // 0.0–1.0
-    uint8_t hue  = (uint8_t)((1.0f - frac) * 170.0f);  // 170=blue, 0=red
-    uint8_t val  = (uint8_t)(130 + frac * 125.0f);      // brighter toward top
+    float frac   = (float)row / (float)(NUM_ROWS - 1);   // 0..1, bottom→top
+    uint8_t hue  = (uint8_t)((1.0f - frac) * 170.0f);    // 170 blue → 0 red
+    uint8_t val  = (uint8_t)(130 + frac * 125.0f);       // brighter near top
     return CHSV(hue, 255, val);
 }
 
-// =============================================================================
-//  DRAW SPECTROGRAM
-//
-//  Each column draws:
-//    1. A solid bar from row 0 up to barHeight, colored by row position.
-//    2. A single bright white peak-hold dot above the bar that hangs briefly
-//       then falls — gives the eye a clear anchor for musical transients.
-// =============================================================================
 void drawSpectrogram() {
     FastLED.clear();
-
     for (int col = 0; col < NUM_COLS; col++) {
-        // ── Bar body ─────────────────────────────────────────────────────
+        // Bar body
         int barH = constrain((int)(barHeights[col] * NUM_ROWS + 0.5f), 0, NUM_ROWS);
         for (int row = 0; row < barH; row++) {
             leds[getLEDIndex(col, row)] = rowColor(row);
         }
-
-        // ── Peak hold dot ─────────────────────────────────────────────────
-        // Only draw if the dot is above the current bar top and has
-        // meaningful height, so it never overlaps the bar body.
+        // Peak-hold dot — only above the bar so it never gets buried.
         int peakRow = (int)(peakHold[col] * NUM_ROWS - 0.5f);
         peakRow = constrain(peakRow, 0, NUM_ROWS - 1);
         if (peakHold[col] > 0.05f && peakRow >= barH) {
             leds[getLEDIndex(col, peakRow)] = CRGB(255, 255, 200);
         }
     }
-
     FastLED.setBrightness(g_bright);
     FastLED.show();
 }
 
 // =============================================================================
-//  SERIAL COMMAND HANDLER
+//  SERIAL COMMANDS
 // =============================================================================
 void printHelp() {
     Serial.println("─────────────────────────────────────────────────────");
-    Serial.println("  gain   <float>   amplification          default 2.5");
-    Serial.println("  floor  <float>   per-bin noise gate     default 250");
-    Serial.println("  max    <float>   full-bar peak value    default 22000");
-    Serial.println("  decay  <0–1>     bar fall speed         default 0.85");
-    Serial.println("  attack <0–1>     bar rise speed         default 0.70");
-    Serial.println("  bright <0–255>   LED brightness         default 160");
-    Serial.println("  pdrop  <float>   peak-dot fall/frame    default 0.025");
-    Serial.println("  phold  <int>     frames to hold peak    default 18");
-    Serial.println("  status           show current values");
-    Serial.println("  help             this list");
+    Serial.println("  attack <0–1>    rise speed             default 0.45");
+    Serial.println("  decay  <0–1>    fall speed             default 0.08");
+    Serial.println("  range  <dB>     dB → full bar          default 28.0");
+    Serial.println("  tilt   <dB>     high-freq boost        default 8.0");
+    Serial.println("  margin <dB>     gate above noise floor default 4.0");
+    Serial.println("  bright <0–255>  LED brightness         default 160");
+    Serial.println("  pdrop  <float>  peak-dot fall/frame    default 0.020");
+    Serial.println("  phold  <int>    frames to hold peak    default 18");
+    Serial.println("  reset           relearn noise floor");
+    Serial.println("  status          show current values");
+    Serial.println("  help            this list");
     Serial.println("─────────────────────────────────────────────────────");
-    Serial.println("  QUICK TUNING:");
-    Serial.println("  peak bar < 0.3  →  max 10000");
-    Serial.println("  peak bar = 1.00 →  max 35000");
-    Serial.println("  noise flicker   →  floor 500");
-    Serial.println("  too responsive  →  decay 0.92");
-    Serial.println("  too sluggish    →  decay 0.72, attack 0.90");
+    Serial.println("  TUNING TIPS");
+    Serial.println("  too jumpy / noisy   →  margin 7,  decay 0.05");
+    Serial.println("  bars look frozen    →  attack 0.7, decay 0.20");
+    Serial.println("  only left side lit  →  tilt 14");
+    Serial.println("  bars never reach 8  →  range 22");
+    Serial.println("  bars always pegged  →  range 36");
+    Serial.println("  moved to new room   →  reset");
     Serial.println("─────────────────────────────────────────────────────");
 }
 
 void printStatus() {
     Serial.println("─────────────────────────────────────────────────────");
-    Serial.printf ("  gain   = %.2f\n", g_gain);
-    Serial.printf ("  floor  = %.1f\n", g_floor);
-    Serial.printf ("  max    = %.0f\n", g_max);
-    Serial.printf ("  decay  = %.3f\n", g_decay);
     Serial.printf ("  attack = %.3f\n", g_attack);
-    Serial.printf ("  bright = %d\n",   g_bright);
-    Serial.printf ("  pdrop  = %.3f\n", g_pdrop);
+    Serial.printf ("  decay  = %.3f\n", g_decay);
+    Serial.printf ("  range  = %.1f dB\n", g_rangeDb);
+    Serial.printf ("  tilt   = %.1f dB\n", g_tiltDb);
+    Serial.printf ("  margin = %.1f dB\n", g_marginDb);
+    Serial.printf ("  bright = %d\n",     g_bright);
+    Serial.printf ("  pdrop  = %.3f\n",   g_pdrop);
     Serial.printf ("  phold  = %d frames\n", g_phold);
     Serial.println("─────────────────────────────────────────────────────");
+}
+
+void resetNoiseFloor() {
+    for (int i = 0; i < NUM_COLS; i++) noiseFloorDb[i] = 0.0f;
+    noiseFloorInit = false;
+    Serial.println("[OK] Noise floor reset; will re-adapt over the next ~2 seconds.");
 }
 
 void handleSerial() {
@@ -287,28 +283,29 @@ void handleSerial() {
             cmd.toLowerCase();
             float val  = arg.toFloat();
 
-            if      (cmd == "help")   { printHelp(); }
-            else if (cmd == "status") { printStatus(); }
-            else if (cmd == "gain")   { g_gain   = max(0.1f, val);
-                                        Serial.printf("[OK] gain = %.2f\n", g_gain); }
-            else if (cmd == "floor")  { g_floor  = max(0.0f, val);
-                                        Serial.printf("[OK] floor = %.1f\n", g_floor); }
-            else if (cmd == "max")    { g_max    = max(100.0f, val);
-                                        Serial.printf("[OK] max = %.0f\n", g_max); }
-            else if (cmd == "decay")  { g_decay  = constrain(val, 0.0f, 0.99f);
-                                        Serial.printf("[OK] decay = %.3f\n", g_decay); }
-            else if (cmd == "attack") { g_attack = constrain(val, 0.01f, 1.0f);
+            if      (cmd == "help")   printHelp();
+            else if (cmd == "status") printStatus();
+            else if (cmd == "reset")  resetNoiseFloor();
+            else if (cmd == "attack") { g_attack   = constrain(val, 0.01f, 1.0f);
                                         Serial.printf("[OK] attack = %.3f\n", g_attack); }
-            else if (cmd == "bright") { g_bright = (uint8_t)constrain((int)val, 0, 255);
+            else if (cmd == "decay")  { g_decay    = constrain(val, 0.001f, 1.0f);
+                                        Serial.printf("[OK] decay  = %.3f\n", g_decay); }
+            else if (cmd == "range")  { g_rangeDb  = constrain(val, 5.0f, 80.0f);
+                                        Serial.printf("[OK] range  = %.1f dB\n", g_rangeDb); }
+            else if (cmd == "tilt")   { g_tiltDb   = constrain(val, 0.0f, 30.0f);
+                                        Serial.printf("[OK] tilt   = %.1f dB\n", g_tiltDb); }
+            else if (cmd == "margin") { g_marginDb = constrain(val, 0.0f, 30.0f);
+                                        Serial.printf("[OK] margin = %.1f dB\n", g_marginDb); }
+            else if (cmd == "bright") { g_bright   = (uint8_t)constrain((int)val, 0, 255);
                                         Serial.printf("[OK] bright = %d\n", g_bright); }
-            else if (cmd == "pdrop")  { g_pdrop  = constrain(val, 0.001f, 0.5f);
-                                        Serial.printf("[OK] pdrop = %.3f\n", g_pdrop); }
-            else if (cmd == "phold")  { g_phold  = constrain((int)val, 0, 120);
-                                        Serial.printf("[OK] phold = %d\n", g_phold); }
+            else if (cmd == "pdrop")  { g_pdrop    = constrain(val, 0.001f, 0.5f);
+                                        Serial.printf("[OK] pdrop  = %.3f\n", g_pdrop); }
+            else if (cmd == "phold")  { g_phold    = constrain((int)val, 0, 120);
+                                        Serial.printf("[OK] phold  = %d frames\n", g_phold); }
             else { Serial.printf("[??] Unknown: '%s'  (type 'help')\n", cmd.c_str()); }
             buf = "";
-        } else {
-            if (buf.length() < 64) buf += c;
+        } else if (buf.length() < 64) {
+            buf += c;
         }
     }
 }
@@ -330,9 +327,10 @@ void setup() {
     Serial.println("[LED] Matrix white — power OK.");
 
     computeBinBoundaries();
+    resetNoiseFloor();
 
-    // startAudioPipeline() calls analogSetAttenuation() internally;
-    // setupI2S() must run after so i2s_adc_enable() owns ADC1 last.
+    // Pipeline first; setupI2S afterwards so i2s_adc_enable() is the last
+    // thing to claim ADC1 (matches the working order from the original code).
     startAudioPipeline();
     setupI2S();
 
@@ -350,85 +348,100 @@ void setup() {
 void loop() {
     handleSerial();
 
-    // ── 1. Capture + DC removal ──────────────────────────────────────────
+    // 1. Capture + DC remove
     captureAudio();
 
-    // ── 2. Hann window + FFT ────────────────────────────────────────────
+    // 2. Hann + FFT
     FFT.windowing(FFTWindow::Hann, FFTDirection::Forward);
     FFT.compute(FFTDirection::Forward);
     FFT.complexToMagnitude();
-    // vReal[0..FFT_SAMPLES/2] now holds per-bin magnitudes
 
-    // ── 3. Map bins → columns ────────────────────────────────────────────
-    float peakThisFrame  = 0.0f;
-    float peakFreqHz     = 0.0f;
-    float peakFreqMag    = 0.0f;
+    // 3. Per-column processing
+    float frameMaxDb  = -1e9f;
+    int   frameMaxCol = 0;
 
     for (int col = 0; col < NUM_COLS; col++) {
 
-        // Use the PEAK bin within this column's frequency range rather than
-        // the average. Music has narrow harmonic peaks; averaging dilutes them
-        // and makes all columns look similar. Peak gives sharp column-to-column
-        // contrast so individual notes and harmonics are visible.
-        float colPeak = 0.0f;
+        // 3a. Combine bins: 70% peak + 30% mean.
+        //     Peak alone is too jittery (one noisy bin spikes the column);
+        //     mean alone smears harmonics. The blend keeps transients sharp
+        //     but stabilises the floor.
+        float peak = 0.0f;
+        float sum  = 0.0f;
+        int   nb   = binEnd[col] - binStart[col];
         for (int b = binStart[col]; b < binEnd[col]; b++) {
-            if (vReal[b] > colPeak) colPeak = vReal[b];
-
-            // Track the loudest bin in the whole display range for reporting.
-            // This replaces FFT.majorPeak() which searched below BIN_LOW and
-            // returned spurious low-frequency values (4 Hz, 27 Hz etc).
-            if (vReal[b] > peakFreqMag) {
-                peakFreqMag = vReal[b];
-                peakFreqHz  = b * ((float)SAMPLE_RATE / (float)FFT_SAMPLES);
-            }
+            float v = vReal[b];
+            if (v > peak) peak = v;
+            sum += v;
         }
+        float mag = peak * 0.7f + (sum / max(nb, 1)) * 0.3f;
 
-        // Floor → gain → normalise
-        float level      = max(0.0f, colPeak - g_floor) * g_gain;
-        float normalised = constrain(level / g_max, 0.0f, 1.0f);
+        // 3b. dB scale. The +1 floor inside log keeps it finite when mag→0.
+        float magDb = 20.0f * log10f(mag + 1.0f);
 
-        // Apply a gentle square-root curve so mid-level signals spread across
-        // more of the 8-row height instead of all sitting at the bottom.
-        normalised = sqrtf(normalised);
+        // 3c. Linear frequency tilt. col 0 → +0 dB, col 31 → +g_tiltDb dB.
+        magDb += g_tiltDb * ((float)col / (float)(NUM_COLS - 1));
 
-        // Asymmetric smoothing: fast attack, slow exponential decay
-        if (normalised > barHeights[col]) {
-            barHeights[col] += min(normalised - barHeights[col], g_attack);
+        // 3d. Adaptive per-column noise floor.
+        //     Track minima quickly (so we lock onto silence within a second
+        //     of starting up or after `reset`), but leak upward extremely
+        //     slowly so a sustained loud signal can't drag the floor with
+        //     it. Time constant on the upward leak is ~20–25 s at 30 fps.
+        if (!noiseFloorInit) {
+            noiseFloorDb[col] = magDb;
+        } else if (magDb < noiseFloorDb[col]) {
+            noiseFloorDb[col] = noiseFloorDb[col] * 0.6f   + magDb * 0.4f;
         } else {
-            barHeights[col] = barHeights[col] * g_decay
-                            + normalised      * (1.0f - g_decay);
+            noiseFloorDb[col] = noiseFloorDb[col] * 0.9985f + magDb * 0.0015f;
         }
 
-        // ── Peak hold logic ───────────────────────────────────────────────
-        if (normalised >= peakHold[col]) {
-            // New peak reached: reset the hold timer
-            peakHold[col]  = normalised;
+        // 3e + 3f. Subtract floor + margin, normalise against fixed range.
+        float relDb  = magDb - noiseFloorDb[col] - g_marginDb;
+        float target = (relDb <= 0.0f) ? 0.0f
+                                       : constrain(relDb / g_rangeDb, 0.0f, 1.0f);
+
+        // 3g. Asymmetric attack/decay using consistent smoothing-coefficient
+        //     semantics. Both knobs mean the same thing now: "fraction of
+        //     the way to target per frame". Try attack=0.9 vs 0.2 and you
+        //     will actually see the difference.
+        float diff = target - barHeights[col];
+        if (diff > 0.0f)
+            barHeights[col] += diff * g_attack;
+        else
+            barHeights[col] += diff * g_decay;
+
+        // Peak-hold dot (operates on the pre-smoothed target so it stays
+        // sharp regardless of decay setting).
+        if (target >= peakHold[col]) {
+            peakHold[col]  = target;
             peakTimer[col] = (uint8_t)min(g_phold, 255);
+        } else if (peakTimer[col] > 0) {
+            peakTimer[col]--;
         } else {
-            if (peakTimer[col] > 0) {
-                // Still in hold phase: dot stays put
-                peakTimer[col]--;
-            } else {
-                // Hold expired: dot falls at g_pdrop per frame
-                peakHold[col] = max(0.0f, peakHold[col] - g_pdrop);
-            }
+            peakHold[col] = max(0.0f, peakHold[col] - g_pdrop);
         }
 
-        if (barHeights[col] > peakThisFrame)
-            peakThisFrame = barHeights[col];
+        if (magDb > frameMaxDb) { frameMaxDb = magDb; frameMaxCol = col; }
     }
+    if (!noiseFloorInit) noiseFloorInit = true;
 
-    // ── 4. Render ────────────────────────────────────────────────────────
+    // 4. Render
     drawSpectrogram();
 
-    // ── 5. Diagnostics (every second) ────────────────────────────────────
+    // 5. Diagnostics every second
     static uint32_t lastLog = 0;
     if (millis() - lastLog >= 1000) {
         lastLog = millis();
-        Serial.printf("[FFT] peak bar: %.2f | peak freq: %.0f Hz | "
-                      "gain=%.1f floor=%.0f max=%.0f\n",
-                      peakThisFrame, peakFreqHz,
-                      g_gain, g_floor, g_max);
+        float maxBar = 0.0f;
+        for (int c = 0; c < NUM_COLS; c++)
+            if (barHeights[c] > maxBar) maxBar = barHeights[c];
+        float floorAvg = 0.0f;
+        for (int c = 0; c < NUM_COLS; c++) floorAvg += noiseFloorDb[c];
+        floorAvg /= NUM_COLS;
+        float hzCenter = ((binStart[frameMaxCol] + binEnd[frameMaxCol]) * 0.5f)
+                       * ((float)SAMPLE_RATE / (float)FFT_SAMPLES);
+        Serial.printf("[FFT] maxBar=%.2f  loudestCol=%d (%.0f Hz, %.1f dB)  floor≈%.1f dB\n",
+            maxBar, frameMaxCol, hzCenter, frameMaxDb, floorAvg);
     }
 
     vTaskDelay(pdMS_TO_TICKS(8));
